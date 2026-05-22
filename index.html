@@ -1864,7 +1864,9 @@
             outline: 0;
         }
 
+        .badge.developer,
         .badge.developper { color: #67e8f9; }
+        .badge.superadmin { color: #fbbf24; }
         .badge.owner { color: #c4b5fd; }
         .badge.admin { color: #93c5fd; }
         .badge.user { color: #86efac; }
@@ -2306,6 +2308,7 @@
     <script>
         (() => {
             const APP_KEY = 'DGIFINTECH_PREMIUM_STATE_V1';
+            const CLOUD_SYNC_EVENT = 'dgif-local-state-changed';
             const currency = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 });
             const shortDate = new Intl.DateTimeFormat('id-ID', { day: '2-digit', month: 'short', year: 'numeric' });
             const monthNames = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
@@ -2358,7 +2361,22 @@
                     }
                 },
                 save(nextState) {
-                    localStorage.setItem(APP_KEY, JSON.stringify(nextState));
+                    try {
+                        const json = JSON.stringify(nextState);
+                        const checksum = hashText(json);
+                        if (checksum === lastStorageChecksum) return;
+                        lastStorageChecksum = checksum;
+                        clearTimeout(storageSaveTimer);
+                        storageSaveTimer = setTimeout(() => {
+                            try {
+                                localStorage.setItem(APP_KEY, JSON.stringify(trimStateForStorage(JSON.parse(json))));
+                            } catch (error) {
+                                console.error('DGIF localStorage save failed:', error);
+                            }
+                        }, 650);
+                    } catch (error) {
+                        console.error('DGIF localStorage save failed:', error);
+                    }
                 },
                 exportJSON() {
                     return JSON.stringify(state, null, 2);
@@ -2369,6 +2387,7 @@
                         state = mergeState(structuredClone(defaults), parsed);
                         Storage.save(state);
                         renderAll();
+                        notifyCloudSnapshot('import');
                     });
                 }
             };
@@ -2379,10 +2398,21 @@
             let analyticsChart;
             let route = 'dashboard';
             let editing = { type: null, id: null };
+            let cloudApplying = false;
+            let isRendering = false;
+            let renderQueued = false;
+            let storageSaveTimer = null;
+            let lastStorageChecksum = '';
+            let lastRenderChecksum = '';
+            let snapshotTimer = null;
+            let appBooted = false;
+            let globalEventsBound = false;
 
             document.addEventListener('DOMContentLoaded', init);
 
             function init() {
+                if (appBooted) return;
+                appBooted = true;
                 upgradeShell();
                 buildPages();
                 bindGlobalEvents();
@@ -2620,6 +2650,10 @@
             }
 
             function bindGlobalEvents() {
+                if (globalEventsBound) return;
+                globalEventsBound = true;
+                const debouncedFilterRender = debounce(() => renderTransactions(), 120);
+                const debouncedGlobalSearch = debounce((value) => globalSearch(value), 180);
                 document.addEventListener('click', (event) => {
                     const action = event.target.closest('[data-action]')?.dataset.action;
                     const exportType = event.target.closest('[data-export]')?.dataset.export;
@@ -2635,8 +2669,8 @@
                 });
 
                 document.addEventListener('input', (event) => {
-                    if (event.target.matches('[data-filter]')) renderTransactions();
-                    if (event.target.id === 'globalSearch') globalSearch(event.target.value);
+                    if (event.target.matches('[data-filter]')) debouncedFilterRender();
+                    if (event.target.id === 'globalSearch') debouncedGlobalSearch(event.target.value);
                 });
 
                 document.addEventListener('change', (event) => {
@@ -2753,18 +2787,45 @@
             }
 
             function renderAll() {
+                if (renderQueued || isRendering) return;
+                renderQueued = true;
+                requestAnimationFrame(() => {
+                    renderQueued = false;
+                    renderAllNow();
+                });
+            }
+
+            function renderAllNow() {
+                const renderChecksum = hashText(JSON.stringify({
+                    route,
+                    transactions: state.transactions,
+                    budgets: state.budgets,
+                    savings: state.savings,
+                    bills: state.bills,
+                    notifications: state.notifications,
+                    settings: state.settings
+                }));
+                if (renderChecksum === lastRenderChecksum && !cloudApplying) return;
+                lastRenderChecksum = renderChecksum;
+                isRendering = true;
                 Storage.save(state);
-                renderDashboard();
-                renderTransactions();
-                renderAnalytics();
-                renderBudgets();
-                renderSavings();
-                renderBills();
-                renderReports();
-                renderCalendar();
-                renderNotifications();
-                syncSettingsInputs();
-                applySettings();
+                try {
+                    renderDashboard();
+                    renderTransactions();
+                    renderAnalytics();
+                    renderBudgets();
+                    renderSavings();
+                    renderBills();
+                    renderReports();
+                    renderCalendar();
+                    renderNotifications();
+                    syncSettingsInputs();
+                    applySettings();
+                } catch (error) {
+                    console.error('DGIF render failed:', error);
+                } finally {
+                    isRendering = false;
+                }
             }
 
             function totals() {
@@ -2956,6 +3017,7 @@
                 const data = formData(form);
                 const current = state.transactions.find((x) => x.id === editing.id);
                 const proofInput = form.querySelector('[name="proof"]');
+                const now = new Date().toISOString();
                 const next = {
                     id: editing.id || uid(),
                     title: data.title,
@@ -2967,7 +3029,9 @@
                     tags: data.tags ? data.tags.split(',').map((x) => x.trim()).filter(Boolean) : [],
                     recurring: data.recurring === 'true',
                     proof: proofInput.files?.[0]?.name || current?.proof || '',
-                    notes: data.notes || ''
+                    notes: data.notes || '',
+                    createdAt: current?.createdAt || now,
+                    updatedAt: now
                 };
                 upsert('transactions', next);
                 addNotification('Transaksi masuk', `${next.title} sebesar ${money(next.amount)} berhasil disimpan.`, 'fa-receipt');
@@ -3034,16 +3098,95 @@
                 return Object.fromEntries(new FormData(form).entries());
             }
 
-            function upsert(key, item) {
+            function upsert(key, item, options = {}) {
+                const shouldSync = options.sync !== false;
+                const now = new Date().toISOString();
                 const index = state[key].findIndex((x) => x.id === item.id);
-                if (index >= 0) state[key][index] = item;
-                else state[key].unshift(item);
+                const current = index >= 0 ? state[key][index] : null;
+                const next = {
+                    ...item,
+                    id: item.id || uid(),
+                    createdAt: item.createdAt || current?.createdAt || now,
+                    updatedAt: item.updatedAt || now
+                };
+                if (index >= 0) state[key][index] = next;
+                else state[key].unshift(next);
+                if (shouldSync && !cloudApplying) notifyCloudMutation('upsert', key, next, current);
             }
 
             function removeItem(key, id, message) {
+                const current = state[key].find((x) => x.id === id);
                 state[key] = state[key].filter((x) => x.id !== id);
+                if (current && !cloudApplying) notifyCloudMutation('delete', key, current, current);
                 renderAll();
                 toast('warning', message, 'Data tersimpan ulang ke localStorage.');
+            }
+
+            function notifyCloudMutation(action, key, item, previous) {
+                try {
+                    window.dispatchEvent(new CustomEvent(CLOUD_SYNC_EVENT, { detail: { action, key, item, previous } }));
+                    window.DGIFFirestoreSync?.handleLocalMutation?.(action, key, item, previous);
+                } catch (error) {
+                    console.error('DGIF cloud mutation bridge failed:', error);
+                }
+            }
+
+            function notifyCloudSnapshot(reason = 'manual') {
+                try {
+                    window.DGIFFirestoreSync?.saveSnapshot?.(state, reason);
+                } catch (error) {
+                    console.error('DGIF cloud snapshot bridge failed:', error);
+                }
+            }
+
+            function queueCloudSnapshot(reason = 'render') {
+                if (cloudApplying || isRendering || reason === 'render') return;
+                clearTimeout(snapshotTimer);
+                snapshotTimer = setTimeout(() => notifyCloudSnapshot(reason), 1500);
+            }
+
+            function normalizeCloudItem(item = {}) {
+                const normalized = { ...item };
+                ['createdAt', 'updatedAt', 'syncedAt', 'deletedAt'].forEach((key) => {
+                    if (normalized[key]?.toDate) normalized[key] = normalized[key].toDate().toISOString();
+                });
+                return normalized;
+            }
+
+            function mergeCloudRows(key, rows = []) {
+                if (!Array.isArray(state[key])) return;
+                const map = new Map(state[key].map((item) => [item.id, item]));
+                let changed = false;
+                rows.map(normalizeCloudItem).forEach((incoming) => {
+                    if (!incoming.id) return;
+                    const current = map.get(incoming.id);
+                    const incomingChecksum = hashText(JSON.stringify(incoming));
+                    const currentChecksum = current ? hashText(JSON.stringify(current)) : '';
+                    if ((!current || new Date(incoming.updatedAt || incoming.createdAt || 0) >= new Date(current.updatedAt || current.createdAt || 0)) && incomingChecksum !== currentChecksum) {
+                        map.set(incoming.id, { ...current, ...incoming });
+                        changed = true;
+                    }
+                });
+                if (!changed) return;
+                state[key] = [...map.values()].sort(byDateDesc);
+            }
+
+            function applyCloudCollections(payload = {}) {
+                cloudApplying = true;
+                try {
+                    const before = hashText(JSON.stringify({ transactions: state.transactions, settings: state.settings }));
+                    if (Array.isArray(payload.transactions)) mergeCloudRows('transactions', payload.transactions);
+                    if (payload.settings && typeof payload.settings === 'object') state.settings = { ...state.settings, ...payload.settings };
+                    const after = hashText(JSON.stringify({ transactions: state.transactions, settings: state.settings }));
+                    if (before !== after) {
+                        Storage.save(state);
+                        renderAll();
+                    }
+                } catch (error) {
+                    console.error('DGIF cloud apply failed:', error);
+                } finally {
+                    cloudApplying = false;
+                }
             }
 
             function filteredTransactions() {
@@ -3156,6 +3299,7 @@
                     sessionTimeout: Number(document.getElementById('timeoutSetting').value || 20)
                 };
                 renderAll();
+                if (!cloudApplying) notifyCloudMutation('upsert', 'settings', state.settings, null);
                 toast('success', 'Settings tersimpan', 'Preferensi tampilan, keamanan, dan profil diperbarui.');
             }
 
@@ -3298,6 +3442,30 @@
                 return Math.max(0, value);
             }
 
+            function debounce(callback, delay = 160) {
+                let timer;
+                return (...args) => {
+                    clearTimeout(timer);
+                    timer = setTimeout(() => callback(...args), delay);
+                };
+            }
+
+            function hashText(text) {
+                let hash = 0;
+                const source = String(text || '');
+                for (let i = 0; i < source.length; i += 1) hash = ((hash << 5) - hash + source.charCodeAt(i)) | 0;
+                return String(hash);
+            }
+
+            function trimStateForStorage(nextState) {
+                return {
+                    ...nextState,
+                    notifications: (nextState.notifications || []).slice(0, 80),
+                    recentSearches: (nextState.recentSearches || []).slice(0, 10),
+                    transactions: (nextState.transactions || []).slice(0, 2000)
+                };
+            }
+
             function byDateDesc(a, b) {
                 return new Date(b.date) - new Date(a.date);
             }
@@ -3350,6 +3518,34 @@
                 return String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;' }[char]));
             }
 
+            window.DGIFClassicApp = {
+                getState: () => JSON.parse(JSON.stringify(state)),
+                applyCloudCollections,
+                saveLocal: () => Storage.save(state),
+                renderAll,
+                syncSnapshot: notifyCloudSnapshot,
+                upsertLocal: (key, item) => {
+                    cloudApplying = true;
+                    try {
+                        upsert(key, normalizeCloudItem(item), { sync: false });
+                        Storage.save(state);
+                        renderAll();
+                    } finally {
+                        cloudApplying = false;
+                    }
+                },
+                removeLocal: (key, id) => {
+                    cloudApplying = true;
+                    try {
+                        state[key] = state[key].filter((item) => item.id !== id);
+                        Storage.save(state);
+                        renderAll();
+                    } finally {
+                        cloudApplying = false;
+                    }
+                }
+            };
+
             function addRipple(event) {
                 const button = event.target.closest('button, .fab-btn, .menu-item, .icon-btn');
                 if (!button) return;
@@ -3371,7 +3567,35 @@
             if (!window.DGIFEnterprise || window.DGIFEnterprise.status !== "ready") {
                 window.DGIFEnterpriseScriptError = { message: event.message, source: event.filename, line: event.lineno, column: event.colno };
             }
+            console.error("DGIF global error", event.error || event.message);
+            recoverClassicUI();
         });
+        window.addEventListener("unhandledrejection", (event) => {
+            console.error("DGIF async error", event.reason);
+            recoverClassicUI();
+        });
+        window.onerror = (message, source, line, column, error) => {
+            window.DGIFEnterpriseScriptError = { message, source, line, column };
+            console.error("DGIF window.onerror", error || message);
+            recoverClassicUI();
+            return false;
+        };
+        window.onunhandledrejection = (event) => {
+            console.error("DGIF window.onunhandledrejection", event.reason);
+            recoverClassicUI();
+        };
+
+        function recoverClassicUI() {
+            requestAnimationFrame(() => {
+                try {
+                    document.body?.classList.remove("white-screen-recovery");
+                    if (!document.querySelector(".main-content")) document.body?.classList.add("white-screen-recovery");
+                    window.DGIFClassicApp?.renderAll?.();
+                } catch (error) {
+                    console.error("DGIF UI recovery failed", error);
+                }
+            });
+        }
     
 
 
@@ -3392,6 +3616,8 @@
         let setPersistence;
         let signInWithEmailAndPassword;
         let signInWithPopup;
+        let signInWithRedirect;
+        let getRedirectResult;
         let signOut;
         let updateProfile;
         let addDoc;
@@ -3401,12 +3627,16 @@
         let doc;
         let getDoc;
         let getFirestore;
+        let limit;
         let onSnapshot;
         let orderBy;
         let query;
+        let runTransaction;
         let serverTimestamp;
         let setDoc;
         let updateDoc;
+        let where;
+        let writeBatch;
         let getDownloadURL;
         let getStorage;
         let storageRef;
@@ -3431,6 +3661,8 @@
                 setPersistence,
                 signInWithEmailAndPassword,
                 signInWithPopup,
+                signInWithRedirect,
+                getRedirectResult,
                 signOut,
                 updateProfile
             } = authModule);
@@ -3442,12 +3674,16 @@
                 doc,
                 getDoc,
                 getFirestore,
+                limit,
                 onSnapshot,
                 orderBy,
                 query,
+                runTransaction,
                 serverTimestamp,
                 setDoc,
-                updateDoc
+                updateDoc,
+                where,
+                writeBatch
             } = firestoreModule);
             ({
                 getDownloadURL,
@@ -3482,16 +3718,36 @@
         const firebaseStorage = firebaseApp ? getStorage(firebaseApp) : null;
         const googleProvider = GoogleAuthProvider ? new GoogleAuthProvider() : null;
         const LOCAL_STATE_KEY = "DGIFINTECH_PREMIUM_STATE_V1";
+        const PENDING_SYNC_KEY = "DGIFINTECH_PENDING_SYNC_QUEUE_V1";
+        const DEVICE_ID_KEY = "DGIFINTECH_DEVICE_ID_V1";
+        const SUPERADMIN_EMAIL = "superadmin@dgifintech.com";
         const PROTECTED_DEVELOPPER_EMAIL = "devlopdulz@dgifintech.com";
         const OWNER_EMAIL = "asnawi@dgifintech.com";
-        const ROLES = { developper: 4, owner: 3, admin: 2, user: 1 };
-        const ROLE_LABEL = { developper: "Developper", owner: "Owner", admin: "Admin", user: "User" };
+        const ROLES = { superadmin: 5, developer: 4, developper: 4, owner: 3, admin: 2, user: 1 };
+        const ROLE_ALIAS = { developper: "developer" };
+        const ROLE_LABEL = { superadmin: "Superadmin", developer: "Developer", developper: "Developer", owner: "Owner", admin: "Admin", user: "User" };
         const PERMISSIONS = {
             user: ["dashboard:view", "transactions:manage", "analytics:view", "budgets:manage", "savings:manage", "bills:manage", "reports:export", "settings:manage"],
-            admin: ["global:monitor", "global:analytics", "global:transactions"],
+            admin: ["users:read.basic", "global:monitor", "global:analytics", "global:transactions"],
             owner: ["users:create", "users:update", "users:suspend", "users:delete", "global:export"],
-            developper: ["firebase:monitor", "system:logs", "audit:logs", "security:core", "roles:control", "database:monitor"]
+            developer: ["firebase:monitor", "system:logs", "audit:logs", "security:core", "roles:control", "database:monitor"],
+            superadmin: ["superadmin:all", "users:all", "roles:all", "database:all"]
         };
+        const ROLE_VISIBILITY = {
+            superadmin: ["superadmin", "developer", "owner", "admin", "user"],
+            developer: ["developer", "owner", "admin", "user"],
+            owner: ["owner", "admin", "user"],
+            admin: ["admin", "user"],
+            user: []
+        };
+        const ROLE_ASSIGNABLE = {
+            superadmin: ["superadmin", "developer", "owner", "admin", "user"],
+            developer: ["developer", "owner", "admin", "user"],
+            owner: ["owner", "admin", "user"],
+            admin: ["admin", "user"],
+            user: []
+        };
+        const deviceId = getOrCreateDeviceId();
 
         let currentFirebaseUser = null;
         let currentProfile = null;
@@ -3501,6 +3757,20 @@
         let roleFilterValue = "";
         let unsubscribeUsers = null;
         let unsubscribeTransactions = null;
+        let unsubscribeUserTransactions = null;
+        let unsubscribeUserNotes = null;
+        let unsubscribeUserSettings = null;
+        let roleTransactionUnsubs = [];
+        let userSnapshotTimer = null;
+        let userMergeRunning = false;
+        let pendingSyncTimer = null;
+        let reconnectTimer = null;
+        let authObserverUnsubscribe = null;
+        let cloudMutationTimer = null;
+        let cloudMutationQueue = new Map();
+        let lastCloudWriteChecksums = new Map();
+        let lastRolePanelChecksum = "";
+        let initialLocalMergeDone = false;
 
         window.DGIFEnterprise = {
             status: firebaseApp ? "ready" : "firebase-unavailable",
@@ -3528,11 +3798,16 @@
 
         function observeEnterpriseAuth() {
             showEnterpriseLoader("Securing DGIFinTech session...");
-            onAuthStateChanged(firebaseAuth, async (user) => {
+            authObserverUnsubscribe?.();
+            getRedirectResult(firebaseAuth).then((credential) => {
+                if (credential?.user) return createOrUpdateUserProfile(credential.user, { provider: "google-redirect" });
+            }).catch((error) => console.error("DGIF redirect result failed", error));
+            authObserverUnsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
                 try {
                     currentFirebaseUser = user;
                     if (!user) {
                         currentProfile = null;
+                        cleanupUserCloudSync();
                         document.body.classList.add("auth-locked");
                         showAuthScreen("login");
                         hideEnterpriseLoader();
@@ -3551,6 +3826,7 @@
                     renderEnterpriseIdentity();
                     mountRoleSystem();
                     injectCloudSyncPanel();
+                    startUserCloudSync(user);
                     enterpriseToast("success", "Session restored", `Login sebagai ${ROLE_LABEL[currentProfile.role] || "User"}. UI existing tetap digunakan.`);
                 } catch (error) {
                     hideEnterpriseLoader();
@@ -3629,9 +3905,28 @@
                 await createOrUpdateUserProfile(credential.user, { provider: "google" });
                 enterpriseToast("success", "Google Sign In berhasil", "Session Firebase aktif.");
             } catch (error) {
+                console.error("DGIF Google popup failed", error);
+                if (shouldUseRedirectFallback(error)) {
+                    try {
+                        enterpriseToast("info", "Membuka Google Redirect", "Popup diblokir, dialihkan ke mode redirect yang stabil untuk WebView/mobile.");
+                        await setPersistence(firebaseAuth, browserLocalPersistence);
+                        await signInWithRedirect(firebaseAuth, googleProvider);
+                        return;
+                    } catch (redirectError) {
+                        console.error("DGIF Google redirect failed", redirectError);
+                        hideEnterpriseLoader();
+                        enterpriseToast("error", "Google Sign In gagal", humanizeFirebaseError(redirectError));
+                        return;
+                    }
+                }
                 hideEnterpriseLoader();
                 enterpriseToast("error", "Google Sign In gagal", humanizeFirebaseError(error));
             }
+        }
+
+        function shouldUseRedirectFallback(error) {
+            const code = String(error?.code || error?.message || "").toLowerCase();
+            return code.includes("popup") || code.includes("cancelled") || code.includes("blocked") || code.includes("web-storage") || code.includes("unauthorized-domain");
         }
 
         async function enterpriseResetPassword(event) {
@@ -3655,6 +3950,7 @@
         async function enterpriseLogout() {
             showEnterpriseLoader("Signing out...");
             cleanupRoleListeners();
+            cleanupUserCloudSync();
             await signOut(firebaseAuth);
             hideEnterpriseLoader();
         }
@@ -3664,7 +3960,7 @@
             const existing = await getDoc(userRef);
             const existingData = existing.exists() ? existing.data() : {};
             const systemRole = roleForEmail(user.email);
-            const role = systemRole !== "user" ? systemRole : (existingData.role || extra.role || "user");
+            const role = normalizeRole(systemRole !== "user" ? systemRole : (existingData.role || extra.role || "user"));
             const profile = {
                 uid: user.uid,
                 fullName: extra.fullName || user.displayName || existingData.fullName || user.email?.split("@")[0] || "DGIF User",
@@ -3741,21 +4037,442 @@
                 return;
             }
             ensureRolePanel();
-            unsubscribeUsers = onSnapshot(query(collection(firestoreDb, "users"), orderBy("createdAt", "desc")), (snapshot) => {
-                roleUsers = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
+            const allowedRoles = visibleRolesForQuery(currentProfile.role);
+            const userQuery = allowedRoles.length
+                ? query(collection(firestoreDb, "users"), where("role", "in", allowedRoles), orderBy("createdAt", "desc"), limit(200))
+                : query(collection(firestoreDb, "users"), where("role", "==", "__none__"), limit(1));
+            unsubscribeUsers = onSnapshot(userQuery, (snapshot) => {
+                roleUsers = snapshot.docs.map((item) => normalizeUserRecord({ id: item.id, ...item.data() })).filter((user) => canSeeUser(currentProfile.role, user));
+                globalTransactions = [];
                 renderRolePanel();
             }, (error) => enterpriseToast("warning", "User realtime tertunda", humanizeFirebaseError(error)));
-            unsubscribeTransactions = onSnapshot(query(collection(firestoreDb, "transactions"), orderBy("createdAt", "desc")), (snapshot) => {
-                globalTransactions = snapshot.docs.map((item) => ({ id: item.id, ...item.data() }));
-                renderRolePanel();
-            }, (error) => enterpriseToast("warning", "Global transaksi tertunda", humanizeFirebaseError(error)));
         }
 
         function cleanupRoleListeners() {
             if (unsubscribeUsers) unsubscribeUsers();
             if (unsubscribeTransactions) unsubscribeTransactions();
+            roleTransactionUnsubs.forEach((unsubscribe) => {
+                try { unsubscribe(); } catch (error) { console.error("DGIF role transaction unsubscribe failed", error); }
+            });
             unsubscribeUsers = null;
             unsubscribeTransactions = null;
+            roleTransactionUnsubs = [];
+            globalTransactions = [];
+        }
+
+        function mountRoleTransactionListeners(users = []) {
+            roleTransactionUnsubs.forEach((unsubscribe) => {
+                try { unsubscribe(); } catch (error) { console.error("DGIF role transaction cleanup failed", error); }
+            });
+            roleTransactionUnsubs = [];
+            globalTransactions = [];
+        }
+
+        function startUserCloudSync(user) {
+            cleanupUserCloudSync();
+            if (!firestoreDb || !user?.uid) return;
+            initialLocalMergeDone = false;
+            const bootLocalState = readLocalState();
+            const transactionRef = collection(firestoreDb, "users", user.uid, "transactions");
+            const notesRef = collection(firestoreDb, "users", user.uid, "notes");
+            const settingsRef = collection(firestoreDb, "users", user.uid, "settings");
+
+            unsubscribeUserTransactions = onSnapshot(query(transactionRef, orderBy("updatedAt", "desc"), limit(800)), async (snapshot) => {
+                try {
+                    const remoteTransactions = snapshot.docs.map((item) => normalizeFirestoreDoc(item));
+                    window.DGIFClassicApp?.applyCloudCollections?.({ transactions: remoteTransactions });
+                    if (!initialLocalMergeDone) {
+                        initialLocalMergeDone = true;
+                        await autoMergeLocalTransactions(user.uid, remoteTransactions, bootLocalState.transactions || []);
+                    }
+                    flushPendingSyncQueue();
+                } catch (error) {
+                    console.error("DGIF user transaction realtime failed", error);
+                }
+            }, (error) => {
+                console.error("DGIF transaction listener error", error);
+                enterpriseToast("warning", "Realtime transaksi tertunda", humanizeFirebaseError(error));
+            });
+
+            unsubscribeUserNotes = onSnapshot(query(notesRef, orderBy("updatedAt", "desc"), limit(800)), (snapshot) => {
+                try {
+                    syncNotesIntoLocalTransactions(snapshot.docs.map((item) => normalizeFirestoreDoc(item)));
+                } catch (error) {
+                    console.error("DGIF note realtime failed", error);
+                }
+            }, (error) => {
+                console.error("DGIF note listener error", error);
+                enterpriseToast("warning", "Realtime catatan tertunda", humanizeFirebaseError(error));
+            });
+
+            unsubscribeUserSettings = onSnapshot(query(settingsRef, limit(20)), (snapshot) => {
+                try {
+                    const settingsDoc = snapshot.docs.find((item) => item.id === "profile");
+                    if (settingsDoc) applyRemoteSettings(normalizeFirestoreDoc(settingsDoc));
+                } catch (error) {
+                    console.error("DGIF settings realtime failed", error);
+                }
+            }, (error) => {
+                console.error("DGIF settings listener error", error);
+                enterpriseToast("warning", "Realtime settings tertunda", humanizeFirebaseError(error));
+            });
+
+            window.DGIFFirestoreSync = {
+                handleLocalMutation: syncLocalMutationToFirestore,
+                saveSnapshot: debounceUserSnapshot
+            };
+
+            debounceUserSnapshot(window.DGIFClassicApp?.getState?.() || bootLocalState, "login");
+            bindConnectivityRecovery();
+            flushPendingSyncQueue();
+        }
+
+        function cleanupUserCloudSync() {
+            if (unsubscribeUserTransactions) unsubscribeUserTransactions();
+            if (unsubscribeUserNotes) unsubscribeUserNotes();
+            if (unsubscribeUserSettings) unsubscribeUserSettings();
+            clearTimeout(userSnapshotTimer);
+            clearTimeout(pendingSyncTimer);
+            clearTimeout(reconnectTimer);
+            clearTimeout(cloudMutationTimer);
+            unsubscribeUserTransactions = null;
+            unsubscribeUserNotes = null;
+            unsubscribeUserSettings = null;
+            userSnapshotTimer = null;
+            pendingSyncTimer = null;
+            reconnectTimer = null;
+            cloudMutationTimer = null;
+            cloudMutationQueue.clear();
+            window.removeEventListener("online", handleOnlineRecovery);
+            window.removeEventListener("offline", handleOfflineStatus);
+            document.removeEventListener("visibilitychange", handleVisibilityRecovery);
+            window.DGIFFirestoreSync = null;
+        }
+
+        async function syncLocalMutationToFirestore(action, key, item, previous) {
+            if (!currentFirebaseUser?.uid || !firestoreDb) return;
+            const queueKey = `${key}:${action}:${item?.id || "singleton"}`;
+            cloudMutationQueue.set(queueKey, { action, key, item, previous });
+            clearTimeout(cloudMutationTimer);
+            cloudMutationTimer = setTimeout(flushCloudMutationQueue, 800);
+        }
+
+        async function flushCloudMutationQueue() {
+            if (!currentFirebaseUser?.uid || !firestoreDb || !cloudMutationQueue.size) return;
+            const entries = [...cloudMutationQueue.values()];
+            cloudMutationQueue.clear();
+            await Promise.all(entries.map((entry) => writeLocalMutationToFirestore(entry)));
+        }
+
+        async function writeLocalMutationToFirestore({ action, key, item, previous }) {
+            try {
+                if (key === "transactions" && action === "upsert") {
+                    await saveTransactionToFirestore(currentFirebaseUser.uid, item, Boolean(previous));
+                    await syncTransactionNoteToFirestore(currentFirebaseUser.uid, item, previous);
+                    debounceUserSnapshot(window.DGIFClassicApp?.getState?.() || readLocalState(), "transaction-upsert");
+                    return;
+                }
+                if (key === "transactions" && action === "delete") {
+                    await Promise.all([
+                        deleteDoc(doc(firestoreDb, "users", currentFirebaseUser.uid, "transactions", item.id)),
+                        deleteDoc(doc(firestoreDb, "users", currentFirebaseUser.uid, "notes", item.id)).catch((error) => console.error("DGIF note delete skipped", error))
+                    ]);
+                    debounceUserSnapshot(window.DGIFClassicApp?.getState?.() || readLocalState(), "transaction-delete");
+                    return;
+                }
+                if (key === "settings" && action === "upsert") {
+                    await saveSettingsToFirestore(currentFirebaseUser.uid, item);
+                    return;
+                }
+                debounceUserSnapshot(window.DGIFClassicApp?.getState?.() || readLocalState(), `${key}-${action}`);
+            } catch (error) {
+                console.error("DGIF Firestore autosave failed", error);
+                enqueuePendingSync({ action, key, item, previous, createdAt: new Date().toISOString() });
+                enterpriseToast("warning", "Autosave cloud tertunda", humanizeFirebaseError(error));
+            }
+        }
+
+        async function saveTransactionToFirestore(uid, item, isEdit = false) {
+            const ref = doc(firestoreDb, "users", uid, "transactions", item.id);
+            const payload = transactionPayload(item);
+            const checksum = checksumFor(payload);
+            const writeKey = `transactions:${uid}:${item.id}`;
+            if (lastCloudWriteChecksums.get(writeKey) === checksum) return;
+            lastCloudWriteChecksums.set(writeKey, checksum);
+            if (isEdit) {
+                try {
+                    await updateDoc(ref, { ...payload, checksum, deviceId, updatedAt: serverTimestamp(), syncedAt: serverTimestamp() });
+                    return;
+                } catch (error) {
+                    console.error("DGIF transaction update fallback to setDoc", error);
+                }
+            }
+            await setDoc(ref, { ...payload, checksum, deviceId, createdAt: item.createdAt || serverTimestamp(), updatedAt: serverTimestamp(), syncedAt: serverTimestamp() }, { merge: true });
+        }
+
+        async function syncTransactionNoteToFirestore(uid, item, previous = {}) {
+            const ref = doc(firestoreDb, "users", uid, "notes", item.id);
+            if (String(item.notes || "").trim()) {
+                const noteChecksum = checksumFor({ id: item.id, content: item.notes || "" });
+                const writeKey = `notes:${uid}:${item.id}`;
+                if (lastCloudWriteChecksums.get(writeKey) === noteChecksum) return;
+                lastCloudWriteChecksums.set(writeKey, noteChecksum);
+                await setDoc(ref, {
+                    id: item.id,
+                    transactionId: item.id,
+                    title: item.title || "Catatan transaksi",
+                    content: item.notes || "",
+                    uid,
+                    ownerEmail: currentFirebaseUser.email || "",
+                    checksum: noteChecksum,
+                    deviceId,
+                    createdAt: previous?.createdAt || item.createdAt || serverTimestamp(),
+                    updatedAt: serverTimestamp()
+                }, { merge: true });
+                return;
+            }
+            if (previous?.notes) await deleteDoc(ref).catch((error) => console.error("DGIF empty note delete skipped", error));
+        }
+
+        async function autoMergeLocalTransactions(uid, remoteRows = [], seedRows = []) {
+            if (userMergeRunning) return;
+            userMergeRunning = true;
+            try {
+                const localRows = [...(seedRows || []), ...((window.DGIFClassicApp?.getState?.() || readLocalState()).transactions || [])];
+                const dedupedLocal = new Map(localRows.filter((item) => item?.id).map((item) => [item.id, item]));
+                const remoteMap = new Map(remoteRows.map((item) => [item.id, item]));
+                const writes = [];
+                dedupedLocal.forEach((item, id) => {
+                    const remote = remoteMap.get(id);
+                    const localTime = new Date(item.updatedAt || item.createdAt || item.date || 0).getTime();
+                    const remoteTime = new Date(remote?.updatedAt || remote?.createdAt || remote?.date || 0).getTime();
+                    if (!remote || localTime > remoteTime) {
+                        writes.push(saveTransactionToFirestore(uid, item, Boolean(remote)));
+                        if (String(item.notes || "").trim()) writes.push(syncTransactionNoteToFirestore(uid, item, remote || {}));
+                    }
+                });
+                if (writes.length) await Promise.all(writes);
+            } catch (error) {
+                console.error("DGIF local to cloud merge failed", error);
+            } finally {
+                userMergeRunning = false;
+            }
+        }
+
+        function syncNotesIntoLocalTransactions(notes = []) {
+            if (!notes.length || !window.DGIFClassicApp?.getState) return;
+            const current = window.DGIFClassicApp.getState();
+            let changed = false;
+            const noteMap = new Map(notes.filter((item) => item.transactionId).map((item) => [item.transactionId, item]));
+            const transactions = (current.transactions || []).map((item) => {
+                const note = noteMap.get(item.id);
+                if (!note || (item.notes || "") === (note.content || "")) return item;
+                changed = true;
+                return { ...item, notes: note.content || "", updatedAt: note.updatedAt || item.updatedAt };
+            });
+            if (changed) window.DGIFClassicApp.applyCloudCollections({ transactions });
+        }
+
+        function debounceUserSnapshot(payload, reason = "auto") {
+            if (!currentFirebaseUser?.uid || !firestoreDb) return;
+            clearTimeout(userSnapshotTimer);
+            userSnapshotTimer = setTimeout(() => saveUserSnapshot(payload, reason), 1200);
+        }
+
+        async function saveUserSnapshot(payload, reason = "auto") {
+            try {
+                if (!currentFirebaseUser?.uid) return;
+                const snapshotId = "latest";
+                const snapshotChecksum = checksumFor(payload);
+                const writeKey = `snapshots:${currentFirebaseUser.uid}:${snapshotId}`;
+                if (lastCloudWriteChecksums.get(writeKey) === snapshotChecksum) return;
+                lastCloudWriteChecksums.set(writeKey, snapshotChecksum);
+                await setDoc(doc(firestoreDb, "users", currentFirebaseUser.uid, "snapshots", snapshotId), {
+                    id: snapshotId,
+                    uid: currentFirebaseUser.uid,
+                    ownerEmail: currentFirebaseUser.email || "",
+                    reason,
+                    payload,
+                    checksum: snapshotChecksum,
+                    deviceId,
+                    updatedAt: serverTimestamp()
+                }, { merge: true });
+            } catch (error) {
+                console.error("DGIF snapshot autosave failed", error);
+                enqueuePendingSync({ action: "snapshot", key: "snapshots", item: { payload, reason }, createdAt: new Date().toISOString() });
+            }
+        }
+
+        async function saveSettingsToFirestore(uid, settings = {}) {
+            const settingsChecksum = checksumFor(settings);
+            const writeKey = `settings:${uid}:profile`;
+            if (lastCloudWriteChecksums.get(writeKey) === settingsChecksum) return;
+            lastCloudWriteChecksums.set(writeKey, settingsChecksum);
+            await setDoc(doc(firestoreDb, "users", uid, "settings", "profile"), {
+                id: "profile",
+                uid,
+                ownerEmail: currentFirebaseUser.email || "",
+                ...settings,
+                checksum: settingsChecksum,
+                deviceId,
+                updatedAt: serverTimestamp()
+            }, { merge: true });
+        }
+
+        function applyRemoteSettings(remote = {}) {
+            const app = window.DGIFClassicApp;
+            if (!app?.getState) return;
+            const current = app.getState();
+            const nextSettings = { ...(current.settings || {}), ...remote };
+            delete nextSettings.id;
+            delete nextSettings.uid;
+            delete nextSettings.ownerEmail;
+            delete nextSettings.checksum;
+            delete nextSettings.deviceId;
+            delete nextSettings.updatedAt;
+            app.applyCloudCollections?.({ settings: nextSettings });
+        }
+
+        function transactionPayload(item = {}) {
+            return {
+                ...item,
+                uid: currentFirebaseUser.uid,
+                ownerEmail: currentFirebaseUser.email || "",
+                source: "single-file-auto-sync",
+                amount: Number(item.amount || 0),
+                tags: Array.isArray(item.tags) ? item.tags : [],
+                updatedAt: item.updatedAt || new Date().toISOString()
+            };
+        }
+
+        function normalizeFirestoreDoc(item) {
+            const data = { id: item.id, ...item.data() };
+            ["createdAt", "updatedAt", "syncedAt", "deletedAt"].forEach((key) => {
+                if (data[key]?.toDate) data[key] = data[key].toDate().toISOString();
+            });
+            return data;
+        }
+
+        function getOrCreateDeviceId() {
+            try {
+                const existing = localStorage.getItem(DEVICE_ID_KEY);
+                if (existing) return existing;
+                const next = `device-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+                localStorage.setItem(DEVICE_ID_KEY, next);
+                return next;
+            } catch {
+                return `device-memory-${Date.now().toString(36)}`;
+            }
+        }
+
+        function checksumFor(value) {
+            const json = stableStringify(value);
+            let hash = 0;
+            for (let i = 0; i < json.length; i += 1) hash = ((hash << 5) - hash + json.charCodeAt(i)) | 0;
+            return Math.abs(hash).toString(36);
+        }
+
+        function stableStringify(value) {
+            if (value === null || typeof value !== "object") return JSON.stringify(value);
+            if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+            return `{${Object.keys(value).sort().filter((key) => !["updatedAt", "syncedAt"].includes(key)).map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
+        }
+
+        function enqueuePendingSync(entry) {
+            try {
+                const queue = readPendingSyncQueue();
+                const dedupeKey = `${entry.key}:${entry.action}:${entry.item?.id || entry.item?.checksum || Date.now()}`;
+                const next = queue.filter((item) => item.dedupeKey !== dedupeKey);
+                next.push({ ...entry, dedupeKey, tries: Number(entry.tries || 0) });
+                localStorage.setItem(PENDING_SYNC_KEY, JSON.stringify(next.slice(-200)));
+                schedulePendingFlush();
+            } catch (error) {
+                console.error("DGIF pending queue save failed", error);
+            }
+        }
+
+        function readPendingSyncQueue() {
+            try {
+                return JSON.parse(localStorage.getItem(PENDING_SYNC_KEY) || "[]");
+            } catch {
+                return [];
+            }
+        }
+
+        function schedulePendingFlush(delay = 2500) {
+            clearTimeout(pendingSyncTimer);
+            pendingSyncTimer = setTimeout(flushPendingSyncQueue, delay);
+        }
+
+        async function flushPendingSyncQueue() {
+            if (!currentFirebaseUser?.uid || !navigator.onLine) return;
+            const queue = readPendingSyncQueue();
+            if (!queue.length) return;
+            const remaining = [];
+            for (const entry of queue) {
+                try {
+                    await replayPendingSync(entry);
+                } catch (error) {
+                    console.error("DGIF pending sync replay failed", error);
+                    if (Number(entry.tries || 0) < 5) remaining.push({ ...entry, tries: Number(entry.tries || 0) + 1 });
+                }
+            }
+            localStorage.setItem(PENDING_SYNC_KEY, JSON.stringify(remaining));
+            if (remaining.length) schedulePendingFlush(6000);
+        }
+
+        async function replayPendingSync(entry) {
+            if (entry.key === "transactions" && entry.action === "upsert") {
+                await saveTransactionToFirestore(currentFirebaseUser.uid, entry.item, true);
+                await syncTransactionNoteToFirestore(currentFirebaseUser.uid, entry.item, entry.previous || {});
+                return;
+            }
+            if (entry.key === "transactions" && entry.action === "delete") {
+                await Promise.all([
+                    deleteDoc(doc(firestoreDb, "users", currentFirebaseUser.uid, "transactions", entry.item.id)),
+                    deleteDoc(doc(firestoreDb, "users", currentFirebaseUser.uid, "notes", entry.item.id)).catch(() => {})
+                ]);
+                return;
+            }
+            if (entry.key === "settings") {
+                await saveSettingsToFirestore(currentFirebaseUser.uid, entry.item);
+                return;
+            }
+            if (entry.key === "snapshots") {
+                await saveUserSnapshot(entry.item.payload, entry.item.reason || "retry");
+            }
+        }
+
+        function bindConnectivityRecovery() {
+            window.removeEventListener("online", handleOnlineRecovery);
+            window.removeEventListener("offline", handleOfflineStatus);
+            document.removeEventListener("visibilitychange", handleVisibilityRecovery);
+            window.addEventListener("online", handleOnlineRecovery, { passive: true });
+            window.addEventListener("offline", handleOfflineStatus, { passive: true });
+            document.addEventListener("visibilitychange", handleVisibilityRecovery, { passive: true });
+        }
+
+        function handleOnlineRecovery() {
+            enterpriseToast("success", "Koneksi pulih", "Pending sync dikirim ulang ke Firestore.");
+            flushPendingSyncQueue();
+            reconnectUserRealtime();
+        }
+
+        function handleOfflineStatus() {
+            enterpriseToast("warning", "Offline mode", "Data tetap aman di localStorage dan pending queue.");
+        }
+
+        function handleVisibilityRecovery() {
+            if (document.visibilityState === "visible") {
+                flushPendingSyncQueue();
+                reconnectUserRealtime();
+            }
+        }
+
+        function reconnectUserRealtime() {
+            if (!currentFirebaseUser?.uid) return;
+            clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => startUserCloudSync(currentFirebaseUser), 500);
         }
 
         function ensureRolePanel() {
@@ -3767,8 +4484,9 @@
         function renderRolePanel() {
             const panel = document.getElementById("roleEnterprisePanel");
             if (!panel || !currentProfile || !isElevated(currentProfile.role)) return;
-            const metrics = computeGlobalMetrics(roleUsers, globalTransactions);
-            panel.innerHTML = `
+            const visibleUsers = roleUsers.filter((user) => canSeeUser(currentProfile.role, user));
+            const metrics = computeGlobalMetrics(visibleUsers, globalTransactions);
+            const nextMarkup = `
                 <div class="toolbar-row">
                     <div>
                         <h3>Enterprise Role Center</h3>
@@ -3782,14 +4500,19 @@
                     <div class="premium-card span-3"><div class="metric-label">Global Transactions</div><div class="metric-value">${metrics.transactions}</div></div>
                     <div class="premium-card span-3"><div class="metric-label">Global Cashflow</div><div class="metric-value">${enterpriseMoney(metrics.cashflow)}</div></div>
                 </div>
-                ${["owner", "developper"].includes(currentProfile.role) ? userManagementMarkup() : adminMonitoringMarkup()}
-                ${currentProfile.role === "developper" ? developerCoreMarkup() : ""}
+                ${canUseUserManagement(currentProfile.role) ? userManagementMarkup() : adminMonitoringMarkup()}
+                ${["developer", "superadmin"].includes(normalizeRole(currentProfile.role)) ? developerCoreMarkup() : ""}
             `;
+            const checksum = checksumFor(nextMarkup);
+            if (checksum === lastRolePanelChecksum) return;
+            lastRolePanelChecksum = checksum;
+            panel.innerHTML = nextMarkup;
             bindRolePanelEvents();
         }
 
         function userManagementMarkup() {
             const visibleUsers = roleUsers.filter((user) => {
+                if (!canSeeUser(currentProfile.role, user)) return false;
                 const haystack = `${user.fullName || ""} ${user.email || ""} ${user.role || ""}`.toLowerCase();
                 if (roleSearchQuery && !haystack.includes(roleSearchQuery)) return false;
                 if (roleFilterValue && user.role !== roleFilterValue) return false;
@@ -3797,7 +4520,7 @@
             });
             const rows = visibleUsers.map((user) => {
                 const locked = !canManageUser(currentProfile.role, user);
-                const roleOptions = ["user", "admin", "owner", "developper"].map((role) => `<option value="${role}" ${user.role === role ? "selected" : ""} ${!canAssignRole(currentProfile.role, role) ? "disabled" : ""}>${ROLE_LABEL[role]}</option>`).join("");
+                const roleOptions = assignableRolesFor(currentProfile.role).map((role) => `<option value="${role}" ${normalizeRole(user.role) === role ? "selected" : ""}>${ROLE_LABEL[role]}</option>`).join("");
                 return `<div class="transaction-row role-user-row" data-uid="${escapeHTML(user.uid || user.id)}">
                     <div class="transaction-main">
                         <div class="category-icon"><i class="fa-solid fa-user-shield"></i></div>
@@ -3817,12 +4540,12 @@
                 <form id="inviteUserForm" class="filters role-filter" style="margin-top:14px">
                     <input name="fullName" placeholder="Nama user/admin baru" required>
                     <input name="email" type="email" placeholder="email@domain.com" required>
-                    <select name="role"><option value="user">User</option><option value="admin">Admin</option>${currentProfile.role === "owner" ? '<option value="owner">Owner</option>' : ''}</select>
+                    <select name="role">${assignableRolesFor(currentProfile.role).map((role) => `<option value="${role}">${ROLE_LABEL[role]}</option>`).join("")}</select>
                     <button class="action-btn" type="submit"><i class="fa-solid fa-user-plus"></i>Add User</button>
                 </form>
                 <div class="filters role-filter" style="margin-top:10px">
                     <input id="roleUserSearch" value="${escapeHTML(roleSearchQuery)}" placeholder="Search user realtime...">
-                    <select id="roleFilter"><option value="">Semua Role</option><option value="user" ${roleFilterValue === "user" ? "selected" : ""}>User</option><option value="admin" ${roleFilterValue === "admin" ? "selected" : ""}>Admin</option><option value="owner" ${roleFilterValue === "owner" ? "selected" : ""}>Owner</option><option value="developper" ${roleFilterValue === "developper" ? "selected" : ""}>Developper</option></select>
+                    <select id="roleFilter"><option value="">Semua Role</option>${visibleRolesFor(currentProfile.role).map((role) => `<option value="${role}" ${roleFilterValue === role ? "selected" : ""}>${ROLE_LABEL[role]}</option>`).join("")}</select>
                 </div>
                 <div class="transaction-list" style="margin-top:14px">${rows || enterpriseEmptyState("fa-users", "Belum ada user", "User Firebase akan muncul realtime setelah login/register.")}</div>
             </div>`;
@@ -3834,11 +4557,11 @@
 
         function developerCoreMarkup() {
             return `<div class="premium-card role-section">
-                <h3>Developper Core Tools</h3>
+                <h3>Developer Core Tools</h3>
                 <div class="premium-grid role-metrics">
                     <div class="premium-card span-3"><strong>Firebase Monitor</strong><p class="muted">Realtime listener aktif.</p></div>
                     <div class="premium-card span-3"><strong>Audit Logs</strong><p class="muted">Role/user action dicatat.</p></div>
-                    <div class="premium-card span-3"><strong>Security Core</strong><p class="muted">Developper immutable.</p></div>
+                    <div class="premium-card span-3"><strong>Security Core</strong><p class="muted">Developer dan superadmin protected.</p></div>
                     <div class="premium-card span-3"><strong>Cloud Backup</strong><p class="muted">Snapshot local data tersedia.</p></div>
                 </div>
             </div>`;
@@ -3889,12 +4612,18 @@
             if (!targetUser) return;
             try {
                 if (button.dataset.roleAction === "role") {
-                    const nextRole = row.querySelector("[data-role-select]").value;
+                    const nextRole = normalizeRole(row.querySelector("[data-role-select]").value);
                     assertRoleAssignment(currentProfile.role, targetUser, nextRole);
-                    await updateDoc(doc(firestoreDb, "users", targetUser.uid || targetUser.id), {
-                        role: nextRole,
-                        permissions: permissionsForRole(nextRole),
-                        updatedAt: serverTimestamp()
+                    await runTransaction(firestoreDb, async (transaction) => {
+                        const targetRef = doc(firestoreDb, "users", targetUser.uid || targetUser.id);
+                        const fresh = await transaction.get(targetRef);
+                        const freshUser = normalizeUserRecord({ id: fresh.id, ...(fresh.exists() ? fresh.data() : targetUser) });
+                        assertRoleAssignment(currentProfile.role, freshUser, nextRole);
+                        transaction.update(targetRef, {
+                            role: nextRole,
+                            permissions: permissionsForRole(nextRole),
+                            updatedAt: serverTimestamp()
+                        });
                     });
                     await writeAudit("users.role.update", { target: targetUser.email, role: nextRole });
                 }
@@ -3945,24 +4674,46 @@
             try {
                 const state = readLocalState();
                 const rows = state.transactions || [];
-                await Promise.all(rows.map((item) => addDoc(collection(firestoreDb, "transactions"), {
-                    ...item,
-                    uid: currentFirebaseUser.uid,
-                    ownerEmail: currentFirebaseUser.email,
-                    source: "single-file-localStorage-sync",
-                    syncedAt: serverTimestamp(),
-                    createdAt: serverTimestamp(),
-                    updatedAt: serverTimestamp()
-                })));
+                await batchSaveTransactions(currentFirebaseUser.uid, rows);
                 enterpriseToast("success", "Cloud sync berhasil", `${rows.length} transaksi dikirim ke Firestore.`);
             } catch (error) {
+                console.error("DGIF manual transaction sync failed", error);
                 enterpriseToast("warning", "Cloud sync tertunda", humanizeFirebaseError(error));
+            }
+        }
+
+        async function batchSaveTransactions(uid, rows = []) {
+            const chunks = [];
+            for (let i = 0; i < rows.length; i += 450) chunks.push(rows.slice(i, i + 450));
+            for (const chunk of chunks) {
+                const batch = writeBatch(firestoreDb);
+                chunk.forEach((item) => {
+                    if (!item?.id) return;
+                    const ref = doc(firestoreDb, "users", uid, "transactions", item.id);
+                    const payload = transactionPayload(item);
+                    batch.set(ref, { ...payload, checksum: checksumFor(payload), deviceId, createdAt: item.createdAt || serverTimestamp(), updatedAt: serverTimestamp(), syncedAt: serverTimestamp() }, { merge: true });
+                    if (String(item.notes || "").trim()) {
+                        batch.set(doc(firestoreDb, "users", uid, "notes", item.id), {
+                            id: item.id,
+                            transactionId: item.id,
+                            title: item.title || "Catatan transaksi",
+                            content: item.notes || "",
+                            uid,
+                            ownerEmail: currentFirebaseUser.email || "",
+                            checksum: checksumFor({ id: item.id, content: item.notes || "" }),
+                            deviceId,
+                            createdAt: item.createdAt || serverTimestamp(),
+                            updatedAt: serverTimestamp()
+                        }, { merge: true });
+                    }
+                });
+                await batch.commit();
             }
         }
 
         async function syncEnterpriseSnapshot() {
             try {
-                await addDoc(collection(firestoreDb, "reports"), {
+                await addDoc(collection(firestoreDb, "users", currentFirebaseUser.uid, "snapshots"), {
                     uid: currentFirebaseUser.uid,
                     ownerEmail: currentFirebaseUser.email,
                     type: "single-file-local-backup",
@@ -3970,8 +4721,9 @@
                     createdAt: serverTimestamp(),
                     updatedAt: serverTimestamp()
                 });
-                enterpriseToast("success", "Backup cloud tersimpan", "Snapshot localStorage masuk ke reports collection.");
+                enterpriseToast("success", "Backup cloud tersimpan", "Snapshot localStorage masuk ke users/{uid}/snapshots.");
             } catch (error) {
+                console.error("DGIF manual snapshot sync failed", error);
                 enterpriseToast("warning", "Backup gagal", humanizeFirebaseError(error));
             }
         }
@@ -3988,40 +4740,72 @@
 
         function roleForEmail(email = "") {
             const normalized = email.toLowerCase();
-            if (normalized === PROTECTED_DEVELOPPER_EMAIL) return "developper";
+            if (normalized === SUPERADMIN_EMAIL) return "superadmin";
+            if (normalized === PROTECTED_DEVELOPPER_EMAIL) return "developer";
             if (normalized === OWNER_EMAIL) return "owner";
             return "user";
         }
 
         function normalizeRole(role) {
-            return ROLES[role] ? role : "user";
+            const clean = ROLE_ALIAS[role] || role;
+            return ROLES[clean] ? clean : "user";
         }
 
         function permissionsForRole(role) {
             const cleanRole = normalizeRole(role);
-            if (cleanRole === "developper") return [...PERMISSIONS.user, ...PERMISSIONS.admin, ...PERMISSIONS.owner, ...PERMISSIONS.developper];
+            if (cleanRole === "superadmin") return [...PERMISSIONS.user, ...PERMISSIONS.admin, ...PERMISSIONS.owner, ...PERMISSIONS.developer, ...PERMISSIONS.superadmin];
+            if (cleanRole === "developer") return [...PERMISSIONS.user, ...PERMISSIONS.admin, ...PERMISSIONS.owner, ...PERMISSIONS.developer];
             if (cleanRole === "owner") return [...PERMISSIONS.user, ...PERMISSIONS.admin, ...PERMISSIONS.owner];
             if (cleanRole === "admin") return [...PERMISSIONS.user, ...PERMISSIONS.admin];
             return [...PERMISSIONS.user];
         }
 
         function isElevated(role) {
-            return ["admin", "owner", "developper"].includes(normalizeRole(role));
+            return ["admin", "owner", "developer", "superadmin"].includes(normalizeRole(role));
+        }
+
+        function canUseUserManagement(role) {
+            return ["admin", "owner", "developer", "superadmin"].includes(normalizeRole(role));
+        }
+
+        function visibleRolesFor(role) {
+            return ROLE_VISIBILITY[normalizeRole(role)] || [];
+        }
+
+        function visibleRolesForQuery(role) {
+            const roles = visibleRolesFor(role);
+            return roles.includes("developer") ? [...roles, "developper"].slice(0, 10) : roles;
+        }
+
+        function assignableRolesFor(role) {
+            return ROLE_ASSIGNABLE[normalizeRole(role)] || [];
+        }
+
+        function normalizeUserRecord(user = {}) {
+            const role = normalizeRole(user.role);
+            return { ...user, role, permissions: user.permissions || permissionsForRole(role) };
+        }
+
+        function canSeeUser(actorRole, targetUser = {}) {
+            const targetRole = normalizeRole(targetUser.role);
+            return visibleRolesFor(actorRole).includes(targetRole);
         }
 
         function canManageUser(actorRole, targetUser = {}) {
-            if (targetUser.role === "developper" || targetUser.email?.toLowerCase() === PROTECTED_DEVELOPPER_EMAIL) return false;
-            if (targetUser.uid && targetUser.uid === currentFirebaseUser?.uid && actorRole === "developper") return false;
-            return ["owner", "developper"].includes(normalizeRole(actorRole));
+            const actor = normalizeRole(actorRole);
+            const target = normalizeRole(targetUser.role);
+            if (!canSeeUser(actor, targetUser)) return false;
+            if (actor === "superadmin") return true;
+            if (actor === "developer") return ["developer", "owner", "admin", "user"].includes(target);
+            if (actor === "owner") return ["owner", "admin", "user"].includes(target);
+            if (actor === "admin") return ["admin", "user"].includes(target);
+            return false;
         }
 
         function canAssignRole(actorRole, nextRole) {
             const actor = normalizeRole(actorRole);
             const next = normalizeRole(nextRole);
-            if (next === "developper") return actor === "developper";
-            if (next === "owner") return actor === "developper";
-            if (next === "admin") return ["owner", "developper"].includes(actor);
-            return ["owner", "developper"].includes(actor);
+            return assignableRolesFor(actor).includes(next);
         }
 
         function assertManagePermission(actorRole, targetUser) {
@@ -4029,9 +4813,7 @@
         }
 
         function assertRoleAssignment(actorRole, targetUser, nextRole) {
-            if (targetUser?.email?.toLowerCase() === PROTECTED_DEVELOPPER_EMAIL || targetUser?.role === "developper") {
-                throw new Error("Developper immutable: tidak bisa diubah, dihapus, disuspend, atau didemote.");
-            }
+            if (!canManageUser(actorRole, targetUser)) throw new Error("Role hierarchy melindungi akun ini.");
             if (!canAssignRole(actorRole, nextRole)) throw new Error("Role escalation diblokir.");
         }
 
